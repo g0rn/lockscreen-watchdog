@@ -4,64 +4,87 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows/registry"
 )
+
+var (
+	regNotifyChangeKeyValue *syscall.Proc
+)
+
+func init() {
+	advapi32, err := syscall.LoadDLL("Advapi32.dll")
+	if err != nil {
+		log.Fatalf("Can't load Advapi32.dll %v", err)
+	}
+
+	regNotifyChangeKeyValue, err = advapi32.FindProc("RegNotifyChangeKeyValue")
+	if err != nil {
+		log.Fatalf("Can't find RegNotifyChangeKeyValue function in DLL: %v", err)
+	}
+}
 
 type changeNotification struct {
 	oldValue string
 	newValue string
 }
 
+func readRegKeyString(root registry.Key, keyPath string, keyName string) (string, error) {
+	key, err := registry.OpenKey(root, keyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return "", err
+	}
+	defer key.Close()
+
+	val, _, err := key.GetStringValue(keyName)
+	return val, err
+}
+
+func waitRegKeyChanged(root registry.Key, keyPath string, keyName string) error {
+	key, err := registry.OpenKey(root, keyPath, registry.QUERY_VALUE|syscall.KEY_NOTIFY)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+
+	const REG_NOTIFY_CHANGE_LAST_SET = 0x00000004
+	const REG_NOTIFY_CHANGE_NAME = 0x00000001
+	regNotifyChangeKeyValue.Call(uintptr(key), 0, REG_NOTIFY_CHANGE_LAST_SET|REG_NOTIFY_CHANGE_NAME, 0, 0)
+	return nil
+}
+
 func monitorRegValue(root registry.Key, keyPath string, keyName string, ctx context.Context) (<-chan changeNotification, error) {
 	ch := make(chan changeNotification)
 
-	advapi32, err := syscall.LoadDLL("Advapi32.dll")
+	oldValue, err := readRegKeyString(root, keyPath, keyName)
 	if err != nil {
-		return nil, fmt.Errorf("can't load Advapi32.dll, err: %v", err)
+		return nil, err
 	}
-
-	regNotifyChangeKeyValue, err := advapi32.FindProc("RegNotifyChangeKeyValue")
-	if err != nil {
-		return nil, fmt.Errorf("can't find RegNotifyChangeKeyValue function: %v", err)
-	}
-
-	key, err := registry.OpenKey(root, keyPath, syscall.KEY_NOTIFY|registry.QUERY_VALUE)
-	if err != nil {
-		return nil, fmt.Errorf("can't open key: %v, err: %v", keyPath, err)
-	}
-
-	oldValue, _, err := key.GetStringValue(keyName)
-	if err != nil {
-		return nil, fmt.Errorf("can't get key value, err: %v", err)
-	}
-	key.Close()
 
 	go func() {
-		const REG_NOTIFY_CHANGE_LAST_SET = 0x00000004
-		const REG_NOTIFY_CHANGE_NAME = 0x00000001
 		for {
-			key.Close()
-			key, err = registry.OpenKey(root, keyPath, syscall.KEY_NOTIFY|registry.QUERY_VALUE)
-			if err != nil {
-				log.Fatalf("can't open key: %v, err: %v", keyPath, err)
-			}
-
 			select {
 			case <-ctx.Done():
 				close(ch)
 				return
 			default:
-				regNotifyChangeKeyValue.Call(uintptr(key), 0, REG_NOTIFY_CHANGE_LAST_SET|REG_NOTIFY_CHANGE_NAME, 0, 0)
+				err = waitRegKeyChanged(root, keyPath, keyName)
+				if err != nil {
+					log.Fatalf("waitRegKeyChanged failed: %v", err)
+				}
+
 				if ctx.Err() != nil { // check if context was canceled during wait
 					continue
 				}
-				newValue, _, err := key.GetStringValue(keyName)
+				// Wait before reading new value
+				time.Sleep(5 * time.Second)
+				newValue, err := readRegKeyString(root, keyPath, keyName)
 				if err != nil {
 					ch <- changeNotification{oldValue: oldValue, newValue: ""}
+					continue
 				}
 
 				if oldValue != newValue {
